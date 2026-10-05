@@ -1,0 +1,17 @@
+[versions]
+# 与 yql-android 保持一致，复用本机/使用者已有的 Gradle 缓存
+agp = "8.9.1"
+kotlin = "2.2.10"
+coreKtx = "1.17.0"
+# SRT 协议（Haivision libsrt 的 Android 封装，Apache-2.0）
+srtdroid = "1.9.5"
+junit = "4.13.2"
+
+[libraries]
+junit = { group = "junit", name = "junit", version.ref = "junit" }
+androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
+srtdroid-core = { module = "io.github.thibaultbee.srtdroid:srtdroid-core", version.ref = "srtdroid" }
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }
+kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }

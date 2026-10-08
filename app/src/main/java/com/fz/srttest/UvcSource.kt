@@ -25,7 +25,7 @@ import java.nio.ByteBuffer
  */
 class UvcSource(
     private val context: Context,
-    private val cfg: StreamConfig,
+    @Volatile private var cfg: StreamConfig,
     private val callback: Callback,
 ) : UvcDeviceMonitor.Listener, PreviewRegistry.Listener {
 
@@ -74,6 +74,111 @@ class UvcSource(
     private var fpsWindowStart = 0L
     private var fpsWindowCount = 0
 
+    // —— 曝光 / 增益（网页远程调；uvc 线程每秒刷新这些快照供上报）——
+    /** 请求值：0 = 自动；快门单位 ns，增益为 UVC 绝对值 */
+    @Volatile var reqShutterNs = 0L
+        private set
+    @Volatile var reqGain = 0
+        private set
+    @Volatile var exposureDesc = "自动"
+        private set
+    @Volatile var exposureRangeNs: Pair<Long, Long>? = null
+        private set
+    @Volatile var gainRange: Pair<Int, Int>? = null
+        private set
+    @Volatile var curExposureNs = 0L
+        private set
+    @Volatile var curGain = -1
+        private set
+    @Volatile var aeMode = -1
+        private set
+    @Volatile var supportedSizes: List<String> = emptyList()
+        private set
+    /** 打开时的原始 AE 模式，恢复自动时优先回到它 */
+    private var defaultAeMode = -1
+    private val controlTick = object : Runnable {
+        override fun run() {
+            refreshControlState()
+            if (camera != null) handler.postDelayed(this, 1000)
+        }
+    }
+
+    fun setExposure(shutterNs: Long, gain: Int) {
+        handler.post {
+            reqShutterNs = shutterNs
+            reqGain = gain
+            camera?.let { applyExposure(it) }
+        }
+    }
+
+    /** 换分辨率：同一设备重新协商，回调 onUvcStarted 让会话按新尺寸重建编码器（SRT 不断） */
+    fun changeConfig(newCfg: StreamConfig) {
+        handler.post {
+            cfg = newCfg
+            val cam = camera ?: return@post
+            try {
+                cam.setFrameCallback(null, 0)
+                cam.stopPreview()
+                negotiateAndStart(cam)
+            } catch (t: Throwable) {
+                callback.onUvcError("外接摄像头切换分辨率失败: ${t.message}")
+            }
+        }
+    }
+
+    private fun applyExposure(cam: UVCCamera) {
+        if (!UvcControls.available) {
+            exposureDesc = "不支持（库接口不可用）"
+            return
+        }
+        val units = if (reqShutterNs > 0) {
+            val frameUnits = 10000 / fps.coerceAtLeast(1)
+            val r = UvcControls.exposureRange(cam)
+            var u = (reqShutterNs / 100_000L).toInt().coerceAtMost(frameUnits)
+            if (r != null) u = u.coerceIn(r.first, maxOf(r.first, minOf(r.second, frameUnits)))
+            u
+        } else 0
+        when {
+            reqShutterNs <= 0 && reqGain <= 0 -> {
+                val modes = linkedSetOf<Int>()
+                if (defaultAeMode > 0 && defaultAeMode != UvcControls.MODE_MANUAL &&
+                    defaultAeMode != UvcControls.MODE_SHUTTER_PRIORITY) modes += defaultAeMode
+                modes += UvcControls.MODE_APERTURE_PRIORITY
+                modes += UvcControls.MODE_AUTO
+                val okMode = modes.firstOrNull { UvcControls.setMode(cam, it) }
+                AeConstantFps.apply(cam)
+                exposureDesc = if (okMode != null) "自动(模式$okMode)" else "恢复自动失败"
+            }
+            reqShutterNs > 0 && reqGain <= 0 -> {
+                // 快门优先：曝光固定、摄像头自己调增益；不支持就纯手动，增益保持当前
+                val prio = UvcControls.setMode(cam, UvcControls.MODE_SHUTTER_PRIORITY) &&
+                        UvcControls.getMode(cam) == UvcControls.MODE_SHUTTER_PRIORITY
+                if (!prio) UvcControls.setMode(cam, UvcControls.MODE_MANUAL)
+                UvcControls.setExposure(cam, units)
+                exposureDesc = "快门 ${units / 10.0}ms " + (if (prio) "快门优先(增益自动)" else "纯手动(设备不支持快门优先，增益保持)")
+            }
+            else -> {
+                val keepExp = if (units > 0) units else UvcControls.getExposure(cam)
+                UvcControls.setMode(cam, UvcControls.MODE_MANUAL)
+                if (keepExp > 0) UvcControls.setExposure(cam, keepExp)
+                UvcControls.setGain(cam, reqGain)
+                exposureDesc = "手动 快门 ${keepExp / 10.0}ms${if (units <= 0) "(保持当前)" else ""} 增益 $reqGain"
+            }
+        }
+        EventLog.i(TAG, "远程曝光 → $exposureDesc")
+        refreshControlState()
+    }
+
+    private fun refreshControlState() {
+        val cam = camera ?: return
+        if (!UvcControls.available) return
+        exposureRangeNs = UvcControls.exposureRange(cam)?.let { it.first * 100_000L to it.second * 100_000L }
+        gainRange = UvcControls.gainRange(cam)
+        curExposureNs = UvcControls.getExposure(cam).let { if (it > 0) it * 100_000L else 0L }
+        curGain = UvcControls.getGain(cam)
+        aeMode = UvcControls.getMode(cam)
+    }
+
     fun start() {
         running = true
         UvcDeviceMonitor.addListener(this)
@@ -120,7 +225,16 @@ class UvcSource(
             camera = cam
             deviceName = "${device.productName ?: device.deviceName} " +
                     "%04X:%04X".format(device.vendorId, device.productId)
+            defaultAeMode = if (UvcControls.available) UvcControls.getMode(cam) else -1
+            supportedSizes = try {
+                cam.getSupportedSizeList(UVCCamera.FRAME_FORMAT_MJPEG)?.filterIsInstance<com.jiangdg.utils.Size>()
+                    ?.filter { it.width > 0 && it.height > 0 }
+                    ?.sortedByDescending { it.width * it.height }
+                    ?.map { "${it.width}x${it.height}" }?.distinct()
+            } catch (_: Throwable) { null } ?: emptyList()
             negotiateAndStart(cam)
+            handler.removeCallbacks(controlTick)
+            handler.post(controlTick)
         } catch (t: Throwable) {
             Log.w(TAG, "打开外接摄像头失败: ${t.message}")
             callback.onUvcError("打开外接摄像头失败: ${t.message}")
@@ -191,6 +305,7 @@ class UvcSource(
         cam.setFrameCallback(frameCallback, UVCCamera.PIXEL_FORMAT_NV21)
         cam.startPreview()
         AeConstantFps.apply(cam)
+        if (reqShutterNs > 0 || reqGain > 0) applyExposure(cam)
         // 首帧看门狗：出帧后若没有屏幕预览就摘窗；超时无帧报错
         handler.postDelayed({ afterFirstFrames() }, FIRST_FRAME_TIMEOUT_MS)
     }
@@ -285,6 +400,7 @@ class UvcSource(
     private fun closeCamera() {
         val cam = camera ?: return
         camera = null
+        handler.removeCallbacks(controlTick)
         try { cam.setFrameCallback(null, 0) } catch (_: Throwable) {}
         try { cam.stopPreview() } catch (_: Throwable) {}
         try { cam.destroy() } catch (_: Throwable) {}

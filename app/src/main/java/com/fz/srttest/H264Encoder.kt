@@ -195,6 +195,18 @@ class H264Encoder(
         }
     }
 
+    /** 运行中改目标码率（网页远程调），不重建编码器 */
+    fun setBitrate(kbps: Int) {
+        val c = codec ?: return
+        handler.post {
+            try {
+                c.setParameters(Bundle().apply { putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE, kbps * 1000) })
+            } catch (t: Throwable) {
+                Log.w(TAG, "改码率失败: ${t.message}")
+            }
+        }
+    }
+
     /**
      * 字节缓冲模式送一帧（OTG 回调线程调用）。src = Y 平面 + 交错色度，宽高须等于编码尺寸。
      * 没有空闲输入缓冲就丢帧返回 false（不阻塞采集线程）。

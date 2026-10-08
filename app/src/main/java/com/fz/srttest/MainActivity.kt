@@ -1,17 +1,22 @@
 package com.fz.srttest
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
+import android.provider.Settings
 import android.text.InputType
 import android.view.Gravity
 import android.view.SurfaceHolder
@@ -104,6 +109,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
     override fun onResume() {
         super.onResume()
+        // 网页远程改过分辨率/码率会写回配置，推流中回到前台时表单跟上（未推流时不动，免得冲掉没保存的输入）
+        if (StreamService.session != null) fillForm(StreamConfig.load(this))
         ui.removeCallbacks(statsTick)
         ui.post(statsTick)
     }
@@ -149,6 +156,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             StreamService.stop(this)
             statsView.text = "已停止"
             setStreamingUi(false)
+            fillForm(StreamConfig.load(this))
             return
         }
         val need = mutableListOf(Manifest.permission.CAMERA)
@@ -194,8 +202,27 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         }
         StreamService.start(this)
         urlView.text = "PC 观看（推流开始几秒后可看）：\n浏览器  ${cfg.webPlayUrl}\nVLC/ffplay  ${cfg.srtPlayUrl}\n" +
-                "可直接锁屏，推流在后台继续（照 silu，最省电）"
+                "网页调快门/增益/分辨率  https://api.147258yql.cn/srtlog/ctl?host=${cfg.host}&path=${cfg.path}\n" +
+                "可直接锁屏/切后台，推流继续（照 silu，最省电）"
         setStreamingUi(true)
+        askIgnoreBatteryOptimizations()
+    }
+
+    /** 不在电池优化白名单时，长时间后台可能被系统限制网络/CPU；每次安装只主动问一次 */
+    @SuppressLint("BatteryLife")
+    private fun askIgnoreBatteryOptimizations() {
+        if (Build.VERSION.SDK_INT < 23) return
+        val pm = getSystemService(PowerManager::class.java) ?: return
+        if (pm.isIgnoringBatteryOptimizations(packageName)) return
+        val prefs = getSharedPreferences("ui", MODE_PRIVATE)
+        if (prefs.getBoolean("askedBattery", false)) return
+        prefs.edit().putBoolean("askedBattery", true).apply()
+        try {
+            startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                Uri.parse("package:$packageName")))
+        } catch (_: Throwable) {
+            toast("请在系统设置里把本应用设为「不限制」电池使用，后台推流更稳")
+        }
     }
 
     private fun setStreamingUi(streaming: Boolean) {
@@ -206,12 +233,14 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     // ---------------- 表单 ----------------
 
     /** 用户换分辨率时自动填码率（仍可手动改）；Spinner 初始化时的那次回调不算，免得覆盖已保存的码率 */
+    private var resLastPos = -1
+
     private fun bindAutoBitrate() {
-        var lastPos = resSpinner.selectedItemPosition
+        resLastPos = resSpinner.selectedItemPosition
         resSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
             override fun onItemSelected(parent: AdapterView<*>?, view: View?, pos: Int, id: Long) {
-                if (pos == lastPos) return
-                lastPos = pos
+                if (pos == resLastPos) return
+                resLastPos = pos
                 AUTO_BITRATE[RESOLUTIONS[pos]]?.let { bitrateEdit.setText(it.toString()) }
             }
 
@@ -266,7 +295,9 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         pathEdit.setText(c.path)
         userEdit.setText(c.user)
         passEdit.setText(c.pass)
-        resSpinner.setSelection(RESOLUTIONS.indexOf("${c.width}x${c.height}").coerceAtLeast(0))
+        val resPos = RESOLUTIONS.indexOf("${c.width}x${c.height}").coerceAtLeast(0)
+        resLastPos = resPos   // 程序回填不算用户换分辨率，不自动改码率
+        resSpinner.setSelection(resPos)
         fpsSpinner.setSelection(FPS.indexOf(c.fps.toString()).coerceAtLeast(0))
         bitrateEdit.setText(c.bitrateKbps.toString())
         qpEdit.setText(c.qpMax.toString())

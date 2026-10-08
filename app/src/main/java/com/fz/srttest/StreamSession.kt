@@ -18,20 +18,26 @@ import java.nio.ByteBuffer
  */
 class StreamSession(
     private val context: Context,
-    private val cfgIn: StreamConfig,
+    cfgStart: StreamConfig,
     private val onError: (String) -> Unit,
 ) : UvcSource.Callback {
     companion object {
         private const val TAG = "StreamSession"
+        /** 网页可选的分辨率（与 App 下拉一致） */
+        val RESOLUTIONS = listOf("3840x2160", "2560x1440", "1920x1080", "1440x1080", "1280x720", "1024x768", "640x480")
     }
 
+    /** 用户/网页要的参数（分辨率可能被摄像头/OTG 协商修正，实际值见 [cfg]） */
+    @Volatile private var cfgIn: StreamConfig = cfgStart
     private val muxer = TsMuxer()
     @Volatile private var encoder: H264Encoder? = null
-    private val sender = SrtSender(cfgIn, onNeedKeyFrame = { encoder?.requestKeyFrame() })
+    private val sender = SrtSender(cfgStart, onNeedKeyFrame = { encoder?.requestKeyFrame() })
     private var camera: CameraSource? = null
+    private var cameraId: String? = null
     private var uvc: UvcSource? = null
     private val encoderLock = Any()
     private var startMs = 0L
+    private val remote = RemoteControl(context, this)
 
     /** 实际推流配置（自带摄像头按可用尺寸修正，OTG 按协商结果修正） */
     @Volatile var cfg: StreamConfig = cfgIn
@@ -57,10 +63,12 @@ class StreamSession(
         sender.start()
         startTicker()
         watchNetwork()
+        remote.start()
         if (cfgIn.isUvc) {
             uvc = UvcSource(context, cfgIn, this).also { it.start() }
         } else {
             val id = CameraSource.backCameraId(context) ?: throw IllegalStateException("没有可用的摄像头")
+            cameraId = id
             val size = CameraSource.chooseSize(context, id, cfgIn.width, cfgIn.height)
             cfg = cfgIn.copy(width = size.width, height = size.height)
             val p = CameraSource.choosePreviewSize(context, id, size.width, size.height)
@@ -76,6 +84,7 @@ class StreamSession(
     }
 
     fun stop() {
+        remote.stop()
         ticking = false
         tickThread?.interrupt()
         netCallback?.let { cb ->
@@ -95,8 +104,10 @@ class StreamSession(
     }
 
     private fun newEncoder(c: StreamConfig, surfaceInput: Boolean): H264Encoder {
-        val enc = H264Encoder(c, surfaceInput) { data, ptsUs, isKey ->
-            sender.offer(muxer.mux(data, ptsUs, isKey), isKey)
+        lateinit var enc: H264Encoder
+        enc = H264Encoder(c, surfaceInput) { data, ptsUs, isKey ->
+            // 换分辨率时新旧编码器短暂并存：只收当前编码器的输出（muxer 不是线程安全的）
+            if (encoder === enc) sender.offer(muxer.mux(data, ptsUs, isKey), isKey)
         }
         enc.start()
         encoder = enc
@@ -202,6 +213,118 @@ class StreamSession(
         onError(msg)
     }
 
+    // ---------- 网页远程控制 ----------
+
+    /** 执行网页下发的命令（RemoteControl 线程调用） */
+    fun applyRemote(c: RemoteControl.Command) {
+        EventLog.i(TAG, "网页命令 v${c.ver}: 快门=${if (c.shutterNs > 0) "1/${1_000_000_000L / c.shutterNs}s" else "自动"}" +
+                " 增益=${if (c.gain > 0) c.gain.toString() else "自动"} 分辨率=${c.width}x${c.height} 码率=${c.bitrateKbps}")
+        camera?.setExposure(c.shutterNs, c.gain)
+        uvc?.setExposure(c.shutterNs, c.gain)
+
+        val base = cfgIn
+        val sizeChanged = c.width > 0 && c.height > 0 && (c.width != base.width || c.height != base.height)
+        val brChanged = c.bitrateKbps in 300..50000 && c.bitrateKbps != base.bitrateKbps
+        if (!sizeChanged && !brChanged) return
+        val newBase = base.copy(
+            width = if (sizeChanged) c.width else base.width,
+            height = if (sizeChanged) c.height else base.height,
+            bitrateKbps = if (brChanged) c.bitrateKbps else base.bitrateKbps,
+        )
+        cfgIn = newBase
+        newBase.save(context)
+        if (sizeChanged) {
+            changeResolution(newBase)
+        } else {
+            cfg = cfg.copy(bitrateKbps = newBase.bitrateKbps)
+            encoder?.setBitrate(newBase.bitrateKbps)
+        }
+    }
+
+    /** 自带摄像头：新编码器 → 摄像头会话换到新 Surface → 停旧编码器；OTG：同设备重新协商。SRT 不断 */
+    private fun changeResolution(newBase: StreamConfig) {
+        uvc?.let {
+            it.changeConfig(newBase)
+            return
+        }
+        val cam = camera ?: return
+        val id = cameraId ?: return
+        synchronized(encoderLock) {
+            val size = CameraSource.chooseSize(context, id, newBase.width, newBase.height)
+            val newCfg = newBase.copy(width = size.width, height = size.height)
+            val old = encoder
+            val enc = try {
+                newEncoder(newCfg, surfaceInput = true)
+            } catch (t: Throwable) {
+                EventLog.w(TAG, "换分辨率失败（编码器）: ${t.message ?: t}")
+                return
+            }
+            cfg = newCfg
+            val p = CameraSource.choosePreviewSize(context, id, size.width, size.height)
+            cameraPreviewSize = p.width to p.height
+            cam.switchEncoder(newCfg, enc.inputSurface!!) { old?.stop() }
+            EventLog.i(TAG, "换分辨率 → ${size.width}x${size.height} ${newCfg.bitrateKbps}kbps（SRT 不断）")
+        }
+    }
+
+    /** 上报给网页的状态：能力范围 + 当前值 + 统计 */
+    fun remoteState(): org.json.JSONObject {
+        val o = org.json.JSONObject()
+        val c = cfg
+        val enc = encoder
+        o.put("model", Build.MODEL)
+        o.put("android", Build.VERSION.RELEASE)
+        o.put("source", if (uvc != null) "uvc" else "camera")
+        o.put("width", c.width).put("height", c.height).put("fps", c.fps)
+        o.put("reqWidth", cfgIn.width).put("reqHeight", cfgIn.height)
+        o.put("bitrateKbps", cfgIn.bitrateKbps)
+        o.put("encKbps", enc?.statKbps ?: 0).put("encFps", enc?.statFps ?: 0).put("qp", enc?.statQp ?: -1)
+        o.put("srtState", sender.state.toString())
+        o.put("sndBufMs", sender.sndBufMs).put("rttMs", sender.rttMs.toInt())
+        o.put("sendMbps", sender.sendMbps.toDouble())
+        o.put("sndDrop", sender.sndDropTotal).put("reconnects", sender.reconnects)
+        batteryTempC()?.let { o.put("tempC", it.toDouble()) }
+        o.put("uptimeSec", (System.currentTimeMillis() - startMs) / 1000)
+        val sizes = org.json.JSONArray()
+        val u = uvc
+        val cam = camera
+        if (u != null) {
+            o.put("device", u.deviceName)
+            o.put("gainLabel", "UVC增益")
+            o.put("manualSupported", UvcControls.available && u.exposureRangeNs != null)
+            u.exposureRangeNs?.let { o.put("expMinNs", it.first).put("expMaxNs", it.second) }
+            u.gainRange?.let { o.put("gainMin", it.first).put("gainMax", it.second) }
+            o.put("curExpNs", u.curExposureNs).put("curGain", u.curGain)
+            o.put("reqShutterNs", u.reqShutterNs).put("reqGain", u.reqGain)
+            o.put("exposureDesc", u.exposureDesc)
+            (if (u.supportedSizes.isNotEmpty()) u.supportedSizes else RESOLUTIONS).forEach { sizes.put(it) }
+        } else if (cam != null) {
+            o.put("gainLabel", "ISO")
+            o.put("manualSupported", cam.manualSupported)
+            cam.exposureRangeNs?.let { o.put("expMinNs", it.lower).put("expMaxNs", it.upper) }
+            cam.isoRange?.let { o.put("gainMin", it.lower).put("gainMax", it.upper) }
+            o.put("curExpNs", cam.curExposureNs).put("curGain", cam.curIso)
+            o.put("reqShutterNs", cam.reqShutterNs).put("reqGain", cam.reqIso)
+            o.put("exposureDesc", cam.exposureDesc)
+            cameraSizes().forEach { sizes.put(it) }
+        }
+        o.put("sizes", sizes)
+        return o
+    }
+
+    private var cameraSizesCache: List<String>? = null
+
+    /** 摄像头能原样输出给编码器的分辨率（RESOLUTIONS 里筛） */
+    private fun cameraSizes(): List<String> {
+        cameraSizesCache?.let { return it }
+        val id = cameraId ?: return RESOLUTIONS
+        return RESOLUTIONS.filter { r ->
+            val (w, h) = r.split("x").map { it.toInt() }
+            val s = CameraSource.chooseSize(context, id, w, h)
+            s.width == w && s.height == h
+        }.also { cameraSizesCache = it }
+    }
+
     // ---------- 统计 ----------
 
     /** 电池温度（℃），读系统粘性广播；读不到 null */
@@ -231,10 +354,14 @@ class StreamSession(
                         "   入口丢帧 ${u.gateDrops}   坏帧 ${u.badFrames}   预览 ${u.previewDesc}\n")
                 append("     编码器输入 ${enc?.inputLayout ?: "-"}   编码器忙丢帧 ${enc?.inputFullDrops ?: 0}" +
                         "   色度按 ${if (c.uvcNv12) "NV12" else "NV21"}\n")
+                append("     曝光 ${u.exposureDesc}\n")
             } else {
                 val cam = camera
                 append("摄像头: AE帧率 ${cam?.fpsRangeDesc}   防抖 ${cam?.stabilizationDesc}   ${cam?.previewDesc}\n")
+                append("     曝光 ${cam?.exposureDesc}   实际 1/${cam?.curExposureNs?.takeIf { it > 0 }?.let { 1_000_000_000L / it } ?: "-"}s" +
+                        " ISO ${cam?.curIso ?: "-"}\n")
             }
+            append("网页控制: ${remote.status}\n")
             append("编码器: ${enc?.codecName}   降级档: ${enc?.tierName}   ${enc?.outputFormatDesc}" +
                     "   ${c.width}x${c.height}@${c.fps}\n")
             append("编码: ${enc?.statKbps} kbps / 目标 ${c.bitrateKbps}   ${enc?.statFps} fps" +

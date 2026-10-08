@@ -30,6 +30,8 @@ class RemoteControl(private val context: Context, private val session: StreamSes
         val width: Int,
         val height: Int,
         val bitrateKbps: Int,
+        /** 变焦倍率×100（自带摄像头）；0 = 默认 1x */
+        val zoomX100: Int,
     )
 
     @Volatile private var running = false
@@ -103,6 +105,7 @@ class RemoteControl(private val context: Context, private val session: StreamSes
             width = c.optInt("width", 0),
             height = c.optInt("height", 0),
             bitrateKbps = c.optInt("bitrateKbps", 0),
+            zoomX100 = c.optInt("zoom", 0),
         )
         session.applyRemote(cmd)
         status = "已执行网页命令 v$ver"

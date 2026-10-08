@@ -181,6 +181,46 @@ class CameraSource(private val context: Context) : PreviewRegistry.Listener {
         }
     }
 
+    /** 变焦倍率×100；0 = 默认 1x */
+    @Volatile var reqZoomX100 = 0
+        private set
+
+    /** 变焦范围（倍率×100）：Android 11+ 用 CONTROL_ZOOM_RATIO（逻辑多摄可 <1x），否则数码裁切 1x~最大 */
+    val zoomRangeX100: Pair<Int, Int>?
+        get() {
+            val c = chars ?: return null
+            if (android.os.Build.VERSION.SDK_INT >= 30) {
+                c.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)?.let {
+                    return (it.lower * 100).toInt() to (it.upper * 100).toInt()
+                }
+            }
+            val max = c.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM) ?: return null
+            return if (max > 1f) 100 to (max * 100).toInt() else null
+        }
+
+    fun setZoom(zoomX100: Int) {
+        handler.post {
+            reqZoomX100 = zoomX100
+            submitRepeating()
+        }
+    }
+
+    private fun applyZoom(req: CaptureRequest.Builder, chars: CameraCharacteristics) {
+        val range = zoomRangeX100 ?: return
+        if (reqZoomX100 <= 0) return
+        val z = reqZoomX100.coerceIn(range.first, range.second) / 100f
+        if (android.os.Build.VERSION.SDK_INT >= 30 && chars.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE) != null) {
+            req.set(CaptureRequest.CONTROL_ZOOM_RATIO, z)
+        } else {
+            val active = chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE) ?: return
+            val w = (active.width() / z).toInt()
+            val h = (active.height() / z).toInt()
+            val l = active.left + (active.width() - w) / 2
+            val t = active.top + (active.height() - h) / 2
+            req.set(CaptureRequest.SCALER_CROP_REGION, android.graphics.Rect(l, t, l + w, t + h))
+        }
+    }
+
     /** 快门 / ISO：0 = 自动。只换 repeating request，不重建会话 */
     fun setExposure(shutterNs: Long, iso: Int) {
         handler.post {
@@ -272,6 +312,7 @@ class CameraSource(private val context: Context) : PreviewRegistry.Listener {
             stabilizationDesc = "设备默认"
         }
         applyExposure(req, chars, cfg)
+        applyZoom(req, chars)
         Log.i(TAG, "采集参数: fps=$fpsRangeDesc 防抖=$stabilizationDesc 预览=$previewDesc 曝光=$exposureDesc")
     }
 

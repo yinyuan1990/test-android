@@ -218,8 +218,10 @@ class StreamSession(
     /** 执行网页下发的命令（RemoteControl 线程调用） */
     fun applyRemote(c: RemoteControl.Command) {
         EventLog.i(TAG, "网页命令 v${c.ver}: 快门=${if (c.shutterNs > 0) "1/${1_000_000_000L / c.shutterNs}s" else "自动"}" +
-                " 增益=${if (c.gain > 0) c.gain.toString() else "自动"} 分辨率=${c.width}x${c.height} 码率=${c.bitrateKbps}")
+                " 增益=${if (c.gain > 0) c.gain.toString() else "自动"} 变焦=${if (c.zoomX100 > 0) "%.2fx".format(c.zoomX100 / 100f) else "默认"}" +
+                " 分辨率=${c.width}x${c.height} 码率=${c.bitrateKbps}")
         camera?.setExposure(c.shutterNs, c.gain)
+        camera?.let { if (it.reqZoomX100 != c.zoomX100) it.setZoom(c.zoomX100) }
         uvc?.setExposure(c.shutterNs, c.gain)
 
         val base = cfgIn
@@ -306,6 +308,10 @@ class StreamSession(
             o.put("curExpNs", cam.curExposureNs).put("curGain", cam.curIso)
             o.put("reqShutterNs", cam.reqShutterNs).put("reqGain", cam.reqIso)
             o.put("exposureDesc", cam.exposureDesc)
+            val zr = cam.zoomRangeX100
+            o.put("zoomSupported", zr != null)
+            zr?.let { o.put("zoomMin", it.first).put("zoomMax", it.second) }
+            o.put("reqZoom", cam.reqZoomX100)
             cameraSizes().forEach { sizes.put(it) }
         }
         o.put("sizes", sizes)
@@ -359,7 +365,8 @@ class StreamSession(
                 val cam = camera
                 append("摄像头: AE帧率 ${cam?.fpsRangeDesc}   防抖 ${cam?.stabilizationDesc}   ${cam?.previewDesc}\n")
                 append("     曝光 ${cam?.exposureDesc}   实际 1/${cam?.curExposureNs?.takeIf { it > 0 }?.let { 1_000_000_000L / it } ?: "-"}s" +
-                        " ISO ${cam?.curIso ?: "-"}\n")
+                        " ISO ${cam?.curIso ?: "-"}" +
+                        "   变焦 ${cam?.reqZoomX100?.takeIf { it > 0 }?.let { "%.2fx".format(it / 100f) } ?: "1x"}\n")
             }
             append("网页控制: ${remote.status}\n")
             append("编码器: ${enc?.codecName}   降级档: ${enc?.tierName}   ${enc?.outputFormatDesc}" +

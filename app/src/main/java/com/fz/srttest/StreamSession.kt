@@ -53,9 +53,9 @@ class StreamSession(
                     "   平均QP ${if (qp >= 0) qp.toString() else "不支持(需Android13+)"}" +
                     "   关键帧 ${enc?.keyFrames}\n")
             append("SRT: 发送 ${"%.2f".format(sender.sendMbps)} Mbps   RTT ${"%.0f".format(sender.rttMs)} ms" +
-                    "   积压 ${sender.queuedMs} ms\n")
+                    "   发送缓冲 ${sender.sndBufMs} ms（持续变大=上行不够）\n")
             append("     丢包 ${sender.lossTotal}   重传 ${sender.retransTotal}" +
-                    "   发送端丢弃 ${sender.sndDropTotal}   本地丢帧 ${sender.droppedFrames}" +
+                    "   迟到丢弃 ${sender.sndDropTotal}   断线丢帧 ${sender.droppedFrames}" +
                     "   重连 ${sender.reconnects}")
         }
     }

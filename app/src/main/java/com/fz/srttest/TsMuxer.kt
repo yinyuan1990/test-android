@@ -6,7 +6,7 @@ import java.io.ByteArrayOutputStream
  * 只含一路 H.264 视频的 MPEG-TS 封装（ISO/IEC 13818-1）。
  *
  * - PID：PAT=0x0000，PMT=0x1000，视频=0x0100（同时作 PCR PID）
- * - 每个关键帧前重发 PAT/PMT，观看端中途加入也能立刻起播
+ * - 同 silu：每一帧前都发 PAT/PMT；SPS/PPS 从码流里拆出保存，每个 IDR 前插入
  * - 每个访问单元前加 AUD；无 B 帧，PES 只带 PTS（DTS=PTS）
  * - PCR 放在每个 PES 的首包，比 PTS 早 [PCR_LEAD_90K]，给解码端留缓冲
  */
@@ -21,23 +21,72 @@ class TsMuxer {
         private const val PTS_BASE_90K = 126_000L
         private const val PCR_LEAD_90K = 18_000L
         private val AUD = byteArrayOf(0, 0, 0, 1, 0x09, 0xF0.toByte())
+        private val START_CODE = byteArrayOf(0, 0, 0, 1)
     }
 
     private val cc = IntArray(0x2000)
     private var firstPtsUs = -1L
+    private var sps: ByteArray? = null
+    private var pps: ByteArray? = null
 
     /** 把一个编码帧封装成若干个 188 字节 TS 包，返回拼接后的字节（长度为 188 的整数倍） */
     fun mux(frame: ByteArray, ptsUs: Long, isKey: Boolean): ByteArray {
         if (firstPtsUs < 0) firstPtsUs = ptsUs
         val pts90k = PTS_BASE_90K + (ptsUs - firstPtsUs) * 9 / 100
         val out = ByteArrayOutputStream(frame.size + frame.size / 180 * 4 + 1024)
-        if (isKey) {
-            out.write(psiPacket(PID_PAT, patSection()))
-            out.write(psiPacket(PID_PMT, pmtSection()))
-        }
-        val pes = pesPacket(AUD + frame, pts90k)
+        // 同 silu：每一帧前都发 PAT/PMT，观看端/服务器任意时刻接入都能立刻识别节目
+        out.write(psiPacket(PID_PAT, patSection()))
+        out.write(psiPacket(PID_PMT, pmtSection()))
+        val pes = pesPacket(buildAccessUnit(frame), pts90k)
         writePes(out, pes, pcr90k = pts90k - PCR_LEAD_90K, randomAccess = isKey)
         return out.toByteArray()
+    }
+
+    /**
+     * 同 silu：拆出编码器输出里的 SPS/PPS/AUD 单独保存（不原样转发），每个 IDR 前插入保存的 SPS+PPS；
+     * 访问单元开头加我们自己的 AUD。
+     */
+    private fun buildAccessUnit(frame: ByteArray): ByteArray {
+        val out = ByteArrayOutputStream(frame.size + 64)
+        out.write(AUD)
+        for (nal in splitAnnexB(frame)) {
+            when (nal[0].toInt() and 0x1F) {
+                7 -> sps = nal
+                8 -> pps = nal
+                9 -> {}
+                else -> {
+                    val s = sps
+                    val p = pps
+                    if ((nal[0].toInt() and 0x1F) == 5 && s != null && p != null) {
+                        out.write(START_CODE); out.write(s)
+                        out.write(START_CODE); out.write(p)
+                    }
+                    out.write(START_CODE); out.write(nal)
+                }
+            }
+        }
+        return out.toByteArray()
+    }
+
+    /** Annex-B 码流切成 NAL（不含起始码） */
+    private fun splitAnnexB(data: ByteArray): List<ByteArray> {
+        val nals = ArrayList<ByteArray>()
+        var start = -1
+        var i = 0
+        while (i + 2 < data.size) {
+            if (data[i].toInt() == 0 && data[i + 1].toInt() == 0 && data[i + 2].toInt() == 1) {
+                if (start >= 0) {
+                    var end = i
+                    while (end > start && data[end - 1].toInt() == 0) end--   // 去掉 4 字节起始码的前导 0
+                    if (end > start) nals += data.copyOfRange(start, end)
+                }
+                i += 3
+                start = i
+            } else i++
+        }
+        if (start in 0 until data.size) nals += data.copyOfRange(start, data.size)
+        if (nals.isEmpty() && data.isNotEmpty()) nals += data
+        return nals
     }
 
     // ---------- PES ----------

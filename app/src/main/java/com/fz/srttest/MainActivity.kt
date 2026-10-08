@@ -41,6 +41,11 @@ class MainActivity : Activity() {
         private const val REQ_CAMERA = 1
         private val RESOLUTIONS = listOf(
             "1280x720", "1920x1080", "2560x1440", "3840x2160", "1440x1080", "1024x768", "640x480")
+        /** 选分辨率时自动填的码率：以 silu 默认 720p=8000 为基准按像素量递增，4K 封顶 20000（silu 上限） */
+        private val AUTO_BITRATE = mapOf(
+            "640x480" to 3000, "1024x768" to 5000, "1280x720" to 8000, "1440x1080" to 10000,
+            "1920x1080" to 12000, "2560x1440" to 16000, "3840x2160" to 20000,
+        )
         private val FPS = listOf("30", "25", "60")
         private val MODES = listOf("VBR", "CBR")
         private val PROFILES = listOf("High", "Main", "Baseline")
@@ -86,6 +91,21 @@ class MainActivity : Activity() {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         setContentView(buildUi())
         fillForm(StreamConfig.load(this))
+        bindAutoBitrate()
+    }
+
+    /** 用户换分辨率时自动填码率（仍可手动改）；Spinner 初始化时的那次回调不算，免得覆盖已保存的码率 */
+    private fun bindAutoBitrate() {
+        var lastPos = resSpinner.selectedItemPosition
+        resSpinner.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: View?, pos: Int, id: Long) {
+                if (pos == lastPos) return
+                lastPos = pos
+                AUTO_BITRATE[RESOLUTIONS[pos]]?.let { bitrateEdit.setText(it.toString()) }
+            }
+
+            override fun onNothingSelected(parent: android.widget.AdapterView<*>?) {}
+        }
     }
 
     override fun onStop() {

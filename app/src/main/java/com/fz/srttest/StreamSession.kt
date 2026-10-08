@@ -30,6 +30,10 @@ class StreamSession(
     @Volatile var cfg: StreamConfig = cfgIn
         private set
 
+    /** 屏幕预览要固定的尺寸：自带摄像头 ≤1080p（Camera2 预览上限，与推流尺寸无关）；OTG = 协商尺寸 */
+    @Volatile private var cameraPreviewSize: Pair<Int, Int>? = null
+    val previewSize: Pair<Int, Int> get() = cameraPreviewSize ?: (cfg.width to cfg.height)
+
     /** @throws IllegalStateException 编码器无法配置 / 没有摄像头 */
     fun start() {
         startMs = System.currentTimeMillis()
@@ -40,6 +44,8 @@ class StreamSession(
             val id = CameraSource.backCameraId(context) ?: throw IllegalStateException("没有可用的摄像头")
             val size = CameraSource.chooseSize(context, id, cfgIn.width, cfgIn.height)
             cfg = cfgIn.copy(width = size.width, height = size.height)
+            val p = CameraSource.choosePreviewSize(context, id, size.width, size.height)
+            cameraPreviewSize = p.width to p.height
             val enc = newEncoder(cfg, surfaceInput = true)
             camera = CameraSource(context).also { it.open(id, cfg, enc.inputSurface!!, onError) }
         }
@@ -112,6 +118,10 @@ class StreamSession(
             append("状态: ${sender.state}   已推 ${sec / 60}:${"%02d".format(sec % 60)}" +
                     "   电池 ${temp?.let { "%.1f℃".format(it) } ?: "?"}\n")
             if (sender.lastError.isNotEmpty()) append("错误: ${sender.lastError}\n")
+            if (sec > 5 && (enc == null || enc.statFps == 0)) {
+                append("⚠ 编码器没有输出：" + (if (uvc != null) "外接摄像头未出帧（插好/允许USB访问/看下方 OTG 行）"
+                        else "摄像头未出帧（看下方摄像头行的预览状态）") + "，服务器收不到画面\n")
+            }
             val u = uvc
             if (u != null) {
                 append("OTG: ${u.deviceName}   ${u.formatDesc}   采集 ${u.captureFps}fps" +

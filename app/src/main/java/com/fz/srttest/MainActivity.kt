@@ -85,7 +85,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             val s = StreamService.session
             if (s != null) {
                 statsView.text = s.statsText()
-                syncPreviewSize(s.cfg.width, s.cfg.height)
+                val (pw, ph) = s.previewSize
+                syncPreviewSize(pw, ph)
             }
             setStreamingUi(s != null)
             ui.postDelayed(this, 1000)
@@ -184,7 +185,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 if (size.width != cfg.width || size.height != cfg.height) {
                     toast("该摄像头不支持 ${cfg.width}x${cfg.height}，改用 ${size.width}x${size.height}")
                 }
-                syncPreviewSize(size.width, size.height)
+                val p = CameraSource.choosePreviewSize(this, id, size.width, size.height)
+                syncPreviewSize(p.width, p.height)
             }
         } else {
             toast("请插上外接摄像头并允许 USB 访问")

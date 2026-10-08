@@ -47,6 +47,24 @@ class CameraSource(private val context: Context) : PreviewRegistry.Listener {
                 { Math.abs(it.width * it.height - w * h) },
             )).first()
         }
+
+        /**
+         * 屏幕预览尺寸：同宽高比、不超过 1080p 的最大 SurfaceHolder 尺寸。
+         * Camera2 规定 SurfaceView 预览最大 1080p，推 1440p/4K 时预览若用推流尺寸，会话会配置失败、编码器零帧。
+         */
+        fun choosePreviewSize(ctx: Context, cameraId: String, w: Int, h: Int): Size {
+            val cm = ctx.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+            val map = cm.getCameraCharacteristics(cameraId)
+                .get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            val sizes = map?.getOutputSizes(android.view.SurfaceHolder::class.java)
+                ?.filter { it.width <= 1920 && it.height <= 1080 }
+            if (sizes.isNullOrEmpty()) return Size(minOf(w, 1920), minOf(h, 1080))
+            val ratio = w.toFloat() / h
+            return sizes.sortedWith(compareBy<Size>(
+                { Math.abs(it.width.toFloat() / it.height - ratio) > 0.01f },
+                { -(it.width * it.height) },
+            )).first()
+        }
     }
 
     private val thread = HandlerThread("camera").apply { start() }
@@ -58,6 +76,8 @@ class CameraSource(private val context: Context) : PreviewRegistry.Listener {
     private var encoderSurface: Surface? = null
     private var onError: (String) -> Unit = {}
     @Volatile private var closed = false
+    /** 带预览的会话配置失败过 → 本次推流只输出给编码器（推流绝不被预览卡住） */
+    @Volatile private var previewUnsupported = false
 
     /** 最终生效的 AE 帧率区间 / 防抖状态 / 预览（显示用） */
     @Volatile var fpsRangeDesc: String = ""
@@ -111,9 +131,13 @@ class CameraSource(private val context: Context) : PreviewRegistry.Listener {
         val enc = encoderSurface ?: return
         try { session?.close() } catch (_: Throwable) {}
         session = null
-        val preview = PreviewRegistry.current()
+        val preview = if (previewUnsupported) null else PreviewRegistry.current()
         val targets = if (preview != null) listOf(enc, preview) else listOf(enc)
-        previewDesc = if (preview != null) "屏幕预览" else "无预览（只写编码器）"
+        previewDesc = when {
+            preview != null -> "屏幕预览"
+            previewUnsupported -> "无预览（带预览的会话配置失败，已改为只写编码器）"
+            else -> "无预览（只写编码器）"
+        }
         try {
             camera.createCaptureSession(targets, object : CameraCaptureSession.StateCallback() {
                 override fun onConfigured(s: CameraCaptureSession) {
@@ -130,7 +154,13 @@ class CameraSource(private val context: Context) : PreviewRegistry.Listener {
                 }
 
                 override fun onConfigureFailed(s: CameraCaptureSession) {
-                    onError("摄像头会话配置失败（该分辨率可能不被支持）")
+                    if (preview != null) {
+                        Log.w(TAG, "带预览的会话配置失败 → 改为只写编码器")
+                        previewUnsupported = true
+                        handler.post { createSession() }
+                    } else {
+                        onError("摄像头会话配置失败（该分辨率可能不被支持）")
+                    }
                 }
             }, handler)
         } catch (t: Throwable) {

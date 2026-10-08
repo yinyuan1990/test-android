@@ -116,20 +116,13 @@ class H264Encoder(
         f.setInteger(MediaFormat.KEY_BITRATE_MODE, cfg.bitrateMode)
 
         if (opts and OPT_PROFILE != 0) {
-            when (cfg.profile) {
-                StreamConfig.PROFILE_HIGH -> {
-                    f.setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileHigh)
-                    f.setInteger(MediaFormat.KEY_LEVEL, MediaCodecInfo.CodecProfileLevel.AVCLevel42)
-                }
-                StreamConfig.PROFILE_MAIN -> {
-                    f.setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileMain)
-                    f.setInteger(MediaFormat.KEY_LEVEL, MediaCodecInfo.CodecProfileLevel.AVCLevel42)
-                }
-                else -> {
-                    f.setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline)
-                    f.setInteger(MediaFormat.KEY_LEVEL, MediaCodecInfo.CodecProfileLevel.AVCLevel42)
-                }
+            val profile = when (cfg.profile) {
+                StreamConfig.PROFILE_HIGH -> MediaCodecInfo.CodecProfileLevel.AVCProfileHigh
+                StreamConfig.PROFILE_MAIN -> MediaCodecInfo.CodecProfileLevel.AVCProfileMain
+                else -> MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline
             }
+            f.setInteger(MediaFormat.KEY_PROFILE, profile)
+            f.setInteger(MediaFormat.KEY_LEVEL, avcLevelFor(cfg.width, cfg.height, cfg.fps))
         }
         if (opts and OPT_EXTRA != 0) {
             f.setInteger(MediaFormat.KEY_PRIORITY, 0)
@@ -156,6 +149,22 @@ class H264Encoder(
             f.setInteger("vendor.qti-ext-enc-qp-range.qp-b-max", cfg.qpMax)
         }
         return f
+    }
+
+    /**
+     * 按 H.264 附录 A 的宏块数 / 宏块速率上限选最低够用的 Level（silu 固定 4.2，只够到 1080p）：
+     * 1080p30=4.0、1080p60=4.2、1440p30=5.0、4K30=5.1、4K60=5.2。
+     */
+    private fun avcLevelFor(w: Int, h: Int, fps: Int): Int {
+        val mbs = ((w + 15) / 16) * ((h + 15) / 16)
+        val mbps = mbs.toLong() * fps
+        return when {
+            mbs <= 8192 && mbps <= 245_760 -> MediaCodecInfo.CodecProfileLevel.AVCLevel4
+            mbs <= 8704 && mbps <= 522_240 -> MediaCodecInfo.CodecProfileLevel.AVCLevel42
+            mbs <= 22_080 && mbps <= 589_824 -> MediaCodecInfo.CodecProfileLevel.AVCLevel5
+            mbs <= 36_864 && mbps <= 983_040 -> MediaCodecInfo.CodecProfileLevel.AVCLevel51
+            else -> MediaCodecInfo.CodecProfileLevel.AVCLevel52
+        }
     }
 
     private fun isQualcomm(name: String): Boolean {

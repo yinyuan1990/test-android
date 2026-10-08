@@ -39,7 +39,8 @@ import android.widget.Toast
 class MainActivity : Activity() {
     companion object {
         private const val REQ_CAMERA = 1
-        private val RESOLUTIONS = listOf("1280x720", "1920x1080", "1440x1080", "1024x768", "640x480")
+        private val RESOLUTIONS = listOf(
+            "1280x720", "1920x1080", "2560x1440", "3840x2160", "1440x1080", "1024x768", "640x480")
         private val FPS = listOf("30", "25", "60")
         private val MODES = listOf("VBR", "CBR")
         private val PROFILES = listOf("High", "Main", "Baseline")

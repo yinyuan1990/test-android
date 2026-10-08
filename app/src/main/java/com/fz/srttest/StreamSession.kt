@@ -91,6 +91,7 @@ class StreamSession(
             encoder = null
         }
         sender.stop()
+        LogUploader.uploadAsync(context, "停止推流")
     }
 
     private fun newEncoder(c: StreamConfig, surfaceInput: Boolean): H264Encoder {
@@ -144,10 +145,12 @@ class StreamSession(
     private fun startTicker() {
         ticking = true
         tickThread = Thread({
+            var n = 0
             while (ticking) {
                 try { Thread.sleep(2000) } catch (_: InterruptedException) { break }
                 if (!ticking) break
                 try { EventLog.i(TAG, tickLine()) } catch (_: Throwable) {}
+                if (++n % 15 == 0) LogUploader.uploadAsync(context, "推流中定时上传")
             }
         }, "stats-log").apply { isDaemon = true; start() }
     }
@@ -242,6 +245,7 @@ class StreamSession(
             append("     丢包 ${sender.lossTotal}   重传 ${sender.retransTotal}" +
                     "   迟到丢弃 ${sender.sndDropTotal}   断线丢帧 ${sender.droppedFrames}" +
                     "   重连 ${sender.reconnects}")
+            if (LogUploader.lastResult.isNotEmpty()) append("\n日志: ${LogUploader.lastResult}")
         }
     }
 }

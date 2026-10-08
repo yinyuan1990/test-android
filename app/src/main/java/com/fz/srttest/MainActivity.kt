@@ -17,6 +17,7 @@ import android.view.Gravity
 import android.view.SurfaceHolder
 import android.view.View
 import android.view.ViewGroup
+import android.view.WindowInsets
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
 import android.widget.Button
@@ -300,6 +301,18 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             orientation = LinearLayout.HORIZONTAL
             setBackgroundColor(Color.BLACK)
         }
+        // targetSdk 35 在 Android 15 强制全面屏：内容会画到状态栏/挖孔下面，左上角按钮被状态栏吃掉触摸
+        root.setOnApplyWindowInsetsListener { v, insets ->
+            if (Build.VERSION.SDK_INT >= 30) {
+                val i = insets.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout())
+                v.setPadding(i.left, i.top, i.right, i.bottom)
+            } else {
+                @Suppress("DEPRECATION")
+                v.setPadding(insets.systemWindowInsetLeft, insets.systemWindowInsetTop,
+                    insets.systemWindowInsetRight, insets.systemWindowInsetBottom)
+            }
+            insets
+        }
 
         // 左：预览 + 统计
         val left = FrameLayout(this)
@@ -315,6 +328,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             text = "填好参数后点「开始推流」"
         }
         val logBar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        logBar.addView(smallButton("上传日志") { uploadLog() })
         logBar.addView(smallButton("复制日志") { copyLog() })
         logBar.addView(smallButton("清空日志") {
             EventLog.clear()
@@ -393,6 +407,13 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             }
         })
         return root
+    }
+
+    private fun uploadLog() {
+        toast("正在上传日志…")
+        LogUploader.uploadAsync(this, "手动上传", StreamService.session?.statsText()) { ok, msg ->
+            ui.post { toast(if (ok) "日志$msg" else "上传失败：$msg（可改用复制日志）") }
+        }
     }
 
     private fun copyLog() {

@@ -61,7 +61,7 @@ class StreamService : Service() {
             session = s
             Log.i(TAG, "推流开始 source=${cfg.source} ${cfg.width}x${cfg.height}@${cfg.fps} ${cfg.bitrateKbps}kbps")
         } catch (t: Throwable) {
-            Log.w(TAG, "推流启动失败: ${t.message}")
+            EventLog.w(TAG, "推流启动失败: ${t.message ?: t}")
             toast(t.message ?: "启动失败")
             try { s.stop() } catch (_: Throwable) {}
             releaseWakeLock()
@@ -70,6 +70,7 @@ class StreamService : Service() {
     }
 
     override fun onDestroy() {
+        EventLog.i(TAG, "推流服务结束")
         session?.stop()
         session = null
         releaseWakeLock()

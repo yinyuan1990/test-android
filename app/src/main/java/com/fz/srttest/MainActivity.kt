@@ -314,7 +314,16 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             setPadding(dp(6), dp(4), dp(6), dp(4))
             text = "填好参数后点「开始推流」"
         }
-        left.addView(statsView, FrameLayout.LayoutParams(
+        val logBar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        logBar.addView(smallButton("复制日志") { copyLog() })
+        logBar.addView(smallButton("清空日志") {
+            EventLog.clear()
+            toast("日志已清空")
+        })
+        val overlay = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        overlay.addView(logBar)
+        overlay.addView(statsView)
+        left.addView(overlay, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.TOP or Gravity.START))
         root.addView(left, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 3f))
 
@@ -384,6 +393,28 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             }
         })
         return root
+    }
+
+    private fun copyLog() {
+        val text = EventLog.dump(StreamService.session?.statsText())
+        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        try {
+            cm.setPrimaryClip(ClipData.newPlainText("srt-log", text))
+            toast("已复制日志 ${text.lines().size} 行，粘贴发给开发")
+        } catch (t: Throwable) {
+            toast("复制失败：${t.message}")
+        }
+    }
+
+    private fun smallButton(label: String, onClick: () -> Unit): Button = Button(this).apply {
+        text = label
+        textSize = 11f
+        minHeight = 0
+        minimumHeight = 0
+        minWidth = 0
+        minimumWidth = 0
+        setPadding(dp(10), dp(4), dp(10), dp(4))
+        setOnClickListener { onClick() }
     }
 
     private fun section(title: String) {

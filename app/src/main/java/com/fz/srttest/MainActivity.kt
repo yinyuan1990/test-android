@@ -7,20 +7,17 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Color
-import android.graphics.Matrix
-import android.graphics.RectF
-import android.graphics.SurfaceTexture
 import android.graphics.Typeface
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.text.InputType
 import android.view.Gravity
-import android.view.Surface
-import android.view.TextureView
+import android.view.SurfaceHolder
 import android.view.View
 import android.view.ViewGroup
-import android.view.WindowManager
+import android.widget.AdapterView
 import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.CheckBox
@@ -33,12 +30,14 @@ import android.widget.TextView
 import android.widget.Toast
 
 /**
- * SRT 画质测试：按竞品 silu 的链路（Camera2 录像模板 → 硬件 H.264 VBR+QP 上限 → MPEG-TS → SRT）
- * 推到 MediaMTX，PC 用浏览器 / VLC 观看，与正式版 WebRTC 链路做画质对比。
+ * SRT 画质测试：全量照 silu 的推流方式（前台服务推流、摄像头直写编码器、OTG 一次拷贝 + FrameGate、
+ * 硬件 H.264 VBR+QP 上限 → MPEG-TS → SRT），推到 MediaMTX，PC 用浏览器/VLC 观看，
+ * 与正式版（WebRTC）对比画质与发热。界面只负责参数和预览，推流在 [StreamService] 里跑，锁屏/切后台不停。
  */
-class MainActivity : Activity() {
+class MainActivity : Activity(), SurfaceHolder.Callback {
     companion object {
-        private const val REQ_CAMERA = 1
+        private const val REQ_PERMS = 1
+        private val SOURCES = listOf("手机自带摄像头", "外接OTG摄像头")
         private val RESOLUTIONS = listOf(
             "1280x720", "1920x1080", "2560x1440", "3840x2160", "1440x1080", "1024x768", "640x480")
         /** 选分辨率时自动填的码率：以 silu 默认 720p=8000 为基准按像素量递增，4K 封顶 20000（silu 上限） */
@@ -52,12 +51,13 @@ class MainActivity : Activity() {
         private val RANGES = listOf("Full（同silu）", "Limited", "不设")
     }
 
-    private lateinit var preview: AutoFitTextureView
+    private lateinit var preview: AutoFitSurfaceView
     private lateinit var statsView: TextView
     private lateinit var form: LinearLayout
     private lateinit var startButton: Button
     private lateinit var urlView: TextView
 
+    private lateinit var sourceSpinner: Spinner
     private lateinit var hostEdit: EditText
     private lateinit var portEdit: EditText
     private lateinit var pathEdit: EditText
@@ -72,56 +72,88 @@ class MainActivity : Activity() {
     private lateinit var gopEdit: EditText
     private lateinit var latencyEdit: EditText
     private lateinit var stabCheck: CheckBox
+    private lateinit var nv12Check: CheckBox
     private lateinit var rangeSpinner: Spinner
 
-    private var session: StreamSession? = null
-    private var previewSurface: Surface? = null
-    private var previewSize = 1280 to 720
     private val ui = Handler(Looper.getMainLooper())
+    /** 预览要固定的尺寸（= 推流实际尺寸）；摄像头要求预览 Surface 尺寸是它支持的输出尺寸 */
+    private var previewTarget: Pair<Int, Int>? = null
+    private var holderSize: Pair<Int, Int>? = null
 
     private val statsTick = object : Runnable {
         override fun run() {
-            session?.let { statsView.text = it.statsText() }
+            val s = StreamService.session
+            if (s != null) {
+                statsView.text = s.statsText()
+                syncPreviewSize(s.cfg.width, s.cfg.height)
+            }
+            setStreamingUi(s != null)
             ui.postDelayed(this, 1000)
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         setContentView(buildUi())
         fillForm(StreamConfig.load(this))
         bindAutoBitrate()
+        preview.holder.addCallback(this)
     }
 
-    /** 用户换分辨率时自动填码率（仍可手动改）；Spinner 初始化时的那次回调不算，免得覆盖已保存的码率 */
-    private fun bindAutoBitrate() {
-        var lastPos = resSpinner.selectedItemPosition
-        resSpinner.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
-            override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: View?, pos: Int, id: Long) {
-                if (pos == lastPos) return
-                lastPos = pos
-                AUTO_BITRATE[RESOLUTIONS[pos]]?.let { bitrateEdit.setText(it.toString()) }
-            }
-
-            override fun onNothingSelected(parent: android.widget.AdapterView<*>?) {}
-        }
+    override fun onResume() {
+        super.onResume()
+        ui.removeCallbacks(statsTick)
+        ui.post(statsTick)
     }
 
-    override fun onStop() {
-        super.onStop()
-        stopStream()
+    override fun onPause() {
+        super.onPause()
+        ui.removeCallbacks(statsTick)
+        // 不停推流：推流在前台服务里，界面不可见时预览随 surfaceDestroyed 自动撤掉
+    }
+
+    // ---------------- 预览 Surface ----------------
+
+    override fun surfaceCreated(holder: SurfaceHolder) {}
+
+    override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+        holderSize = width to height
+        registerPreviewIfReady()
+    }
+
+    override fun surfaceDestroyed(holder: SurfaceHolder) {
+        holderSize = null
+        PreviewRegistry.set(null)
+    }
+
+    private fun syncPreviewSize(w: Int, h: Int) {
+        if (previewTarget == w to h) return
+        previewTarget = w to h
+        preview.setAspectRatio(w, h)
+        preview.holder.setFixedSize(w, h)
+        registerPreviewIfReady()
+    }
+
+    /** Surface 尺寸已等于推流尺寸才登记（否则摄像头会话配置会失败） */
+    private fun registerPreviewIfReady() {
+        val t = previewTarget ?: return
+        if (holderSize == t) PreviewRegistry.set(preview.holder.surface)
     }
 
     // ---------------- 推流控制 ----------------
 
     private fun onStartStopClicked() {
-        if (session != null) {
-            stopStream()
+        if (StreamService.session != null) {
+            StreamService.stop(this)
+            statsView.text = "已停止"
+            setStreamingUi(false)
             return
         }
-        if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(arrayOf(Manifest.permission.CAMERA), REQ_CAMERA)
+        val need = mutableListOf(Manifest.permission.CAMERA)
+        if (Build.VERSION.SDK_INT >= 33) need += Manifest.permission.POST_NOTIFICATIONS
+        val missing = need.filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+        if (missing.isNotEmpty()) {
+            requestPermissions(missing.toTypedArray(), REQ_PERMS)
             return
         }
         startStream()
@@ -129,96 +161,60 @@ class MainActivity : Activity() {
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == REQ_CAMERA && grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) {
+        if (requestCode != REQ_PERMS) return
+        if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
             startStream()
         } else {
-            toast("需要摄像头权限")
+            toast("需要摄像头权限（OTG 外接摄像头同样需要）")
         }
     }
 
     private fun startStream() {
-        val cfgInput = readForm() ?: return
-        if (cfgInput.host.isBlank()) {
+        val cfg = readForm() ?: return
+        if (cfg.host.isBlank()) {
             toast("请填写服务器地址")
             return
         }
-        val st = preview.surfaceTexture
-        if (st == null) {
-            toast("预览还没准备好，稍后再试")
-            return
+        cfg.save(this)
+        previewTarget = null
+        if (!cfg.isUvc) {
+            // 自带摄像头：先把预览固定到摄像头可用尺寸，服务起会话时预览 Surface 已就绪
+            CameraSource.backCameraId(this)?.let { id ->
+                val size = CameraSource.chooseSize(this, id, cfg.width, cfg.height)
+                if (size.width != cfg.width || size.height != cfg.height) {
+                    toast("该摄像头不支持 ${cfg.width}x${cfg.height}，改用 ${size.width}x${size.height}")
+                }
+                syncPreviewSize(size.width, size.height)
+            }
+        } else {
+            toast("请插上外接摄像头并允许 USB 访问")
         }
-        val cameraId = CameraSource.backCameraId(this) ?: run {
-            toast("没有可用的摄像头")
-            return
-        }
-        cfgInput.save(this)
-        val size = CameraSource.chooseSize(this, cameraId, cfgInput.width, cfgInput.height)
-        val cfg = cfgInput.copy(width = size.width, height = size.height)
-        if (size.width != cfgInput.width || size.height != cfgInput.height) {
-            toast("该摄像头不支持 ${cfgInput.width}x${cfgInput.height}，改用 ${size.width}x${size.height}")
-        }
-
-        previewSize = size.width to size.height
-        preview.setAspectRatio(size.width, size.height)
-        st.setDefaultBufferSize(size.width, size.height)
-        configureTransform(preview.width, preview.height)
-        val surface = Surface(st)
-        previewSurface = surface
-
-        val s = StreamSession(this, cfg, cameraId, surface) { msg -> ui.post { toast(msg) } }
-        try {
-            s.start()
-        } catch (t: Throwable) {
-            toast(t.message ?: "启动失败")
-            s.stop()
-            surface.release()
-            previewSurface = null
-            return
-        }
-        session = s
-        urlView.text = "PC 观看（推流开始几秒后可看）：\n浏览器  ${cfg.webPlayUrl}\nVLC/ffplay  ${cfg.srtPlayUrl}"
-        setFormEnabled(false)
-        startButton.text = "停止推流"
-        ui.removeCallbacks(statsTick)
-        ui.post(statsTick)
+        StreamService.start(this)
+        urlView.text = "PC 观看（推流开始几秒后可看）：\n浏览器  ${cfg.webPlayUrl}\nVLC/ffplay  ${cfg.srtPlayUrl}\n" +
+                "可直接锁屏，推流在后台继续（照 silu，最省电）"
+        setStreamingUi(true)
     }
 
-    private fun stopStream() {
-        val s = session ?: return
-        session = null
-        s.stop()
-        previewSurface?.release()
-        previewSurface = null
-        ui.removeCallbacks(statsTick)
-        statsView.text = "已停止"
-        setFormEnabled(true)
-        startButton.text = "开始推流"
-    }
-
-    /** 横屏下把摄像头画面转正并铺满（AutoFitTextureView 已保证宽高比一致） */
-    @Suppress("DEPRECATION")
-    private fun configureTransform(viewW: Int, viewH: Int) {
-        if (viewW == 0 || viewH == 0) return
-        val (pw, ph) = previewSize
-        val rotation = windowManager.defaultDisplay.rotation
-        val matrix = Matrix()
-        val viewRect = RectF(0f, 0f, viewW.toFloat(), viewH.toFloat())
-        val bufferRect = RectF(0f, 0f, ph.toFloat(), pw.toFloat())
-        val cx = viewRect.centerX()
-        val cy = viewRect.centerY()
-        if (rotation == Surface.ROTATION_90 || rotation == Surface.ROTATION_270) {
-            bufferRect.offset(cx - bufferRect.centerX(), cy - bufferRect.centerY())
-            matrix.setRectToRect(viewRect, bufferRect, Matrix.ScaleToFit.FILL)
-            val scale = maxOf(viewH.toFloat() / ph, viewW.toFloat() / pw)
-            matrix.postScale(scale, scale, cx, cy)
-            matrix.postRotate((90 * (rotation - 2)).toFloat(), cx, cy)
-        } else if (rotation == Surface.ROTATION_180) {
-            matrix.postRotate(180f, cx, cy)
-        }
-        preview.setTransform(matrix)
+    private fun setStreamingUi(streaming: Boolean) {
+        setFormEnabled(!streaming)
+        startButton.text = if (streaming) "停止推流" else "开始推流"
     }
 
     // ---------------- 表单 ----------------
+
+    /** 用户换分辨率时自动填码率（仍可手动改）；Spinner 初始化时的那次回调不算，免得覆盖已保存的码率 */
+    private fun bindAutoBitrate() {
+        var lastPos = resSpinner.selectedItemPosition
+        resSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>?, view: View?, pos: Int, id: Long) {
+                if (pos == lastPos) return
+                lastPos = pos
+                AUTO_BITRATE[RESOLUTIONS[pos]]?.let { bitrateEdit.setText(it.toString()) }
+            }
+
+            override fun onNothingSelected(parent: AdapterView<*>?) {}
+        }
+    }
 
     private fun readForm(): StreamConfig? {
         fun int(e: EditText, name: String, min: Int, max: Int): Int? {
@@ -255,10 +251,13 @@ class MainActivity : Activity() {
                 2 -> StreamConfig.RANGE_NONE
                 else -> StreamConfig.RANGE_FULL
             },
+            source = if (sourceSpinner.selectedItemPosition == 1) StreamConfig.SOURCE_UVC else StreamConfig.SOURCE_CAMERA,
+            uvcNv12 = nv12Check.isChecked,
         )
     }
 
     private fun fillForm(c: StreamConfig) {
+        sourceSpinner.setSelection(if (c.isUvc) 1 else 0)
         hostEdit.setText(c.host)
         portEdit.setText(c.port.toString())
         pathEdit.setText(c.path)
@@ -277,6 +276,7 @@ class MainActivity : Activity() {
         gopEdit.setText(c.keyIntervalSec.toString())
         latencyEdit.setText(c.latencyMs.toString())
         stabCheck.isChecked = c.disableStabilization
+        nv12Check.isChecked = c.uvcNv12
         rangeSpinner.setSelection(when (c.colorRange) {
             StreamConfig.RANGE_LIMITED -> 1
             StreamConfig.RANGE_NONE -> 2
@@ -301,14 +301,7 @@ class MainActivity : Activity() {
 
         // 左：预览 + 统计
         val left = FrameLayout(this)
-        preview = AutoFitTextureView(this).apply {
-            surfaceTextureListener = object : TextureView.SurfaceTextureListener {
-                override fun onSurfaceTextureAvailable(s: SurfaceTexture, w: Int, h: Int) = configureTransform(w, h)
-                override fun onSurfaceTextureSizeChanged(s: SurfaceTexture, w: Int, h: Int) = configureTransform(w, h)
-                override fun onSurfaceTextureDestroyed(s: SurfaceTexture): Boolean = true
-                override fun onSurfaceTextureUpdated(s: SurfaceTexture) {}
-            }
-        }
+        preview = AutoFitSurfaceView(this)
         left.addView(preview, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.CENTER))
         statsView = TextView(this).apply {
@@ -332,8 +325,17 @@ class MainActivity : Activity() {
         scroll.addView(form)
         root.addView(scroll, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 2f))
 
+        section("采集源")
+        sourceSpinner = spinner("摄像头", SOURCES)
+        nv12Check = CheckBox(this).apply {
+            text = "OTG 色度按 NV12（颜色发蓝/发紫就取消勾选）"
+            setTextColor(Color.WHITE)
+            textSize = 12f
+        }
+        form.addView(LinearLayout(this).apply { addView(nv12Check) })
+
         section("服务器（MediaMTX）")
-        hostEdit = edit("服务器 IP", "如 110.42.9.179", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI)
+        hostEdit = edit("服务器 IP", "如 103.80.16.160", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI)
         portEdit = edit("SRT 端口", "8890", InputType.TYPE_CLASS_NUMBER)
         pathEdit = edit("流名", "test1", InputType.TYPE_CLASS_TEXT)
         userEdit = edit("推流账号", "没设可留空", InputType.TYPE_CLASS_TEXT)

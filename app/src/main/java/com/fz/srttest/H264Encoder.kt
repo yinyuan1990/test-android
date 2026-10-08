@@ -19,6 +19,8 @@ import android.view.Surface
  */
 class H264Encoder(
     private val cfg: StreamConfig,
+    /** true = Surface 输入（自带摄像头直写）；false = 字节缓冲输入（OTG 帧一次拷进编码器，照 silu feedOwnEncoder） */
+    private val surfaceInput: Boolean = true,
     /** 每个编码输出（Annex-B，含起始码）；isKey=IDR 帧。在编码线程回调。 */
     private val onFrame: (data: ByteArray, ptsUs: Long, isKey: Boolean) -> Unit,
 ) {
@@ -73,6 +75,15 @@ class H264Encoder(
         private set
     @Volatile var keyFrames = 0
         private set
+    /** 字节缓冲模式：送帧时编码器没有空闲输入缓冲而丢掉的帧数（同 silu INPUT_FULL） */
+    @Volatile var inputFullDrops = 0
+        private set
+    /** 字节缓冲模式：编码器输入实际布局（NV12/NV21/I420），首帧确定后显示 */
+    @Volatile var inputLayout = ""
+        private set
+
+    /** 字节缓冲模式下空闲的输入缓冲（async 回调入队，送帧线程取用） */
+    private val freeInputs = java.util.concurrent.ConcurrentLinkedQueue<Int>()
 
     /** @throws IllegalStateException 所有降级档都配置失败 */
     fun start() {
@@ -85,7 +96,7 @@ class H264Encoder(
             try {
                 c.setCallback(callback, handler)
                 c.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-                inputSurface = c.createInputSurface()
+                if (surfaceInput) inputSurface = c.createInputSurface()
                 c.start()
                 codec = c
                 codecName = c.name
@@ -105,7 +116,9 @@ class H264Encoder(
 
     private fun buildFormat(name: String, opts: Int): MediaFormat {
         val f = MediaFormat.createVideoFormat(MIME, cfg.width, cfg.height)
-        f.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+        f.setInteger(MediaFormat.KEY_COLOR_FORMAT,
+            if (surfaceInput) MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface
+            else MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
         f.setInteger(MediaFormat.KEY_BIT_RATE, cfg.bitrateKbps * 1000)
         f.setInteger(MediaFormat.KEY_FRAME_RATE, cfg.fps)
         if (Build.VERSION.SDK_INT >= 25) {
@@ -182,9 +195,38 @@ class H264Encoder(
         }
     }
 
+    /**
+     * 字节缓冲模式送一帧（OTG 回调线程调用）。src = Y 平面 + 交错色度，宽高须等于编码尺寸。
+     * 没有空闲输入缓冲就丢帧返回 false（不阻塞采集线程）。
+     */
+    fun feedYuv420sp(src: java.nio.ByteBuffer, w: Int, h: Int, srcNv12: Boolean, ptsUs: Long): Boolean {
+        val c = codec ?: return false
+        val index = freeInputs.poll()
+        if (index == null) {
+            inputFullDrops++
+            return false
+        }
+        return try {
+            val img = c.getInputImage(index)
+            if (img == null) {
+                c.queueInputBuffer(index, 0, 0, ptsUs, 0)
+                return false
+            }
+            YuvCopy.copySemiPlanar(src, w, h, srcNv12, img)
+            if (inputLayout.isEmpty()) inputLayout = YuvCopy.lastLayout
+            c.queueInputBuffer(index, 0, w * h * 3 / 2, ptsUs, 0)
+            true
+        } catch (t: Throwable) {
+            Log.w(TAG, "送帧失败: ${t.message}")
+            try { c.queueInputBuffer(index, 0, 0, ptsUs, 0) } catch (_: Throwable) {}
+            false
+        }
+    }
+
     fun stop() {
         val c = codec
         codec = null
+        freeInputs.clear()
         handler.post {
             try { c?.stop() } catch (_: Throwable) {}
             try { c?.release() } catch (_: Throwable) {}
@@ -196,7 +238,8 @@ class H264Encoder(
 
     private val callback = object : MediaCodec.Callback() {
         override fun onInputBufferAvailable(codec: MediaCodec, index: Int) {
-            // Surface 输入，不会走到这里
+            // Surface 输入不会走到这里；字节缓冲模式把空闲缓冲交给送帧线程
+            if (!surfaceInput) freeInputs.offer(index)
         }
 
         override fun onOutputBufferAvailable(codec: MediaCodec, index: Int, info: MediaCodec.BufferInfo) {

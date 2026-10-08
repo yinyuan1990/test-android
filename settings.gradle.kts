@@ -22,6 +22,8 @@ dependencyResolutionManagement {
         maven { url = uri("https://maven.aliyun.com/repository/public") }
         google()
         mavenCentral()
+        // AUSBC（OTG 外接 USB 摄像头，与 android-otg 同版本）
+        maven { url = uri("https://jitpack.io") }
     }
 }
 

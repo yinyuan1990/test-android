@@ -3,15 +3,20 @@
 按竞品 silu 的推流链路重写的**独立测试版**，用来和正式版（WebRTC 链路）对比 PC 端画质。
 与正式版包名不同，可同时安装。背景见 `yql-android/docs/竞品画质调研-silu.md`。
 
-## 链路
+## 链路（全量照 silu）
 
 ```
-Camera2 录像模板（固定帧率 / 连续视频对焦 / 关闭电子+光学防抖）
-  → 预览 TextureView + 硬件 H.264 编码器输入 Surface（零拷贝）
-  → H.264：默认 High@4.2 / VBR / 8000kbps / QP≤30 / 1 秒关键帧
-  → MPEG-TS（自写封装：PAT/PMT/PES+PCR+AUD，单视频流）
-  → SRT（live 模式，延迟 50ms）→ MediaMTX → 浏览器 / VLC
+自带摄像头：Camera2 录像模板（固定帧率 / 连续视频对焦 / 关闭电子+光学防抖）
+  → 直写硬件编码器输入 Surface（+ 界面可见时同时输出到 SurfaceView 预览；无 GPU 重绘、无 CPU 拷贝）
+OTG 外接摄像头：AUSBC libuvc 解 MJPEG → 帧回调 → FrameGate 按推流帧率丢多余帧
+  → 一次拷进编码器输入（无 UV 交换、无 I420 中转）；界面不可见时摘掉 libuvc 预览窗口（省每帧 RGBA 转换）
+  → H.264：默认 High / VBR / 8000kbps / QP≤30 / 1 秒关键帧（Level 按分辨率×帧率自动选）
+  → MPEG-TS（每帧 PAT/PMT，每 IDR 前插 SPS/PPS，PCR+AUD）
+  → SRT（live，同 silu 选项，编码线程同步发送）→ MediaMTX → 浏览器 / VLC
 ```
+
+推流跑在前台服务里（照 silu `CameraLiveService`：startForeground + 部分唤醒锁），**锁屏/切后台继续推流**，
+不强制屏幕常亮——直接锁屏是最省电、最不烫的用法。统计里有电池温度，便于和正式版同机对比发热。
 
 编码器不认某些参数时会逐级降级（界面「降级档」显示最终生效的是哪一档）：
 

@@ -27,7 +27,13 @@ data class StreamConfig(
     val disableStabilization: Boolean = true,
     /** full / limited / none（none = 不设，交给编码器默认） */
     val colorRange: String = RANGE_FULL,
+    /** camera = 手机自带摄像头；uvc = OTG 外接 USB 摄像头 */
+    val source: String = SOURCE_CAMERA,
+    /** OTG 帧回调的色度排列：AUSBC 3.5.3 标着 NV21 实为 NV12（android-otg 皮肤发蓝实锤），默认按 NV12 */
+    val uvcNv12: Boolean = true,
 ) {
+    val isUvc: Boolean get() = source == SOURCE_UVC
+
     /** MediaMTX 的 SRT streamid：publish:路径[:用户:密码] */
     val publishStreamId: String
         get() = if (user.isNotEmpty()) "publish:$path:$user:$pass" else "publish:$path"
@@ -44,6 +50,7 @@ data class StreamConfig(
             .putString("profile", profile).putInt("keyIntervalSec", keyIntervalSec)
             .putInt("latencyMs", latencyMs).putBoolean("disableStabilization", disableStabilization)
             .putString("colorRange", colorRange)
+            .putString("source", source).putBoolean("uvcNv12", uvcNv12)
             .apply()
     }
 
@@ -54,6 +61,8 @@ data class StreamConfig(
         const val RANGE_FULL = "full"
         const val RANGE_LIMITED = "limited"
         const val RANGE_NONE = "none"
+        const val SOURCE_CAMERA = "camera"
+        const val SOURCE_UVC = "uvc"
         private const val PREFS = "stream_config"
 
         fun load(ctx: Context): StreamConfig {
@@ -76,6 +85,8 @@ data class StreamConfig(
                 latencyMs = p.getInt("latencyMs", d.latencyMs),
                 disableStabilization = p.getBoolean("disableStabilization", d.disableStabilization),
                 colorRange = p.getString("colorRange", d.colorRange) ?: d.colorRange,
+                source = p.getString("source", d.source) ?: d.source,
+                uvcNv12 = p.getBoolean("uvcNv12", d.uvcNv12),
             )
         }
     }

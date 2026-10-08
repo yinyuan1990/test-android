@@ -16,10 +16,12 @@ import android.util.Size
 import android.view.Surface
 
 /**
- * Camera2 采集：后置主摄，录像模板（ISP 走视频调校），同时输出到预览和编码器 Surface。
- * 与 silu 一致：固定帧率、连续视频对焦、关闭电子防抖与光学防抖（防抖会裁切重采样让画面变软）。
+ * Camera2 采集（照 silu `Camera2MediaStreamer.createSession`）：后置主摄，录像模板，
+ * 会话输出 = **编码器 Surface（必选）+ 屏幕预览 Surface（仅界面可见时）**。摄像头直写编码器，
+ * 不经 GPU 重绘、不经 CPU 拷贝；息屏/切后台时预览撤掉，只剩编码器一路。
+ * 固定帧率、连续视频对焦、关闭电子与光学防抖（防抖会裁切重采样让画面变软）。
  */
-class CameraSource(private val context: Context) {
+class CameraSource(private val context: Context) : PreviewRegistry.Listener {
     companion object {
         private const val TAG = "CameraSource"
 
@@ -51,22 +53,34 @@ class CameraSource(private val context: Context) {
     private val handler = Handler(thread.looper)
     private var device: CameraDevice? = null
     private var session: CameraCaptureSession? = null
+    private var chars: CameraCharacteristics? = null
+    private var cfg: StreamConfig? = null
+    private var encoderSurface: Surface? = null
+    private var onError: (String) -> Unit = {}
+    @Volatile private var closed = false
 
-    /** 最终生效的 AE 帧率区间 / 防抖状态（显示用） */
+    /** 最终生效的 AE 帧率区间 / 防抖状态 / 预览（显示用） */
     @Volatile var fpsRangeDesc: String = ""
         private set
     @Volatile var stabilizationDesc: String = ""
         private set
+    @Volatile var previewDesc: String = ""
+        private set
 
     @SuppressLint("MissingPermission")
-    fun open(cameraId: String, cfg: StreamConfig, targets: List<Surface>, onError: (String) -> Unit) {
+    fun open(cameraId: String, cfg: StreamConfig, encoderSurface: Surface, onError: (String) -> Unit) {
+        this.cfg = cfg
+        this.encoderSurface = encoderSurface
+        this.onError = onError
         val cm = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
-        val chars = cm.getCameraCharacteristics(cameraId)
+        chars = cm.getCameraCharacteristics(cameraId)
+        PreviewRegistry.addListener(this)
         try {
             cm.openCamera(cameraId, object : CameraDevice.StateCallback() {
                 override fun onOpened(camera: CameraDevice) {
+                    if (closed) { camera.close(); return }
                     device = camera
-                    createSession(camera, chars, cfg, targets, onError)
+                    createSession()
                 }
 
                 override fun onDisconnected(camera: CameraDevice) {
@@ -86,19 +100,29 @@ class CameraSource(private val context: Context) {
         }
     }
 
+    /** 预览出现/消失：只重建会话，不重开摄像头 */
+    override fun onPreviewChanged(surface: Surface?) {
+        handler.post { if (device != null && !closed) createSession() }
+    }
+
     @Suppress("DEPRECATION")
-    private fun createSession(
-        camera: CameraDevice, chars: CameraCharacteristics, cfg: StreamConfig,
-        targets: List<Surface>, onError: (String) -> Unit,
-    ) {
+    private fun createSession() {
+        val camera = device ?: return
+        val enc = encoderSurface ?: return
+        try { session?.close() } catch (_: Throwable) {}
+        session = null
+        val preview = PreviewRegistry.current()
+        val targets = if (preview != null) listOf(enc, preview) else listOf(enc)
+        previewDesc = if (preview != null) "屏幕预览" else "无预览（只写编码器）"
         try {
             camera.createCaptureSession(targets, object : CameraCaptureSession.StateCallback() {
                 override fun onConfigured(s: CameraCaptureSession) {
+                    if (closed) { s.close(); return }
                     session = s
                     try {
                         val req = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
                         targets.forEach { req.addTarget(it) }
-                        applyParams(req, chars, cfg)
+                        applyParams(req)
                         s.setRepeatingRequest(req.build(), null, handler)
                     } catch (t: Throwable) {
                         onError("下发采集参数失败: ${t.message}")
@@ -114,7 +138,9 @@ class CameraSource(private val context: Context) {
         }
     }
 
-    private fun applyParams(req: CaptureRequest.Builder, chars: CameraCharacteristics, cfg: StreamConfig) {
+    private fun applyParams(req: CaptureRequest.Builder) {
+        val chars = chars ?: return
+        val cfg = cfg ?: return
         req.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
 
         val ranges = chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES) ?: emptyArray()
@@ -141,10 +167,12 @@ class CameraSource(private val context: Context) {
         } else {
             stabilizationDesc = "设备默认"
         }
-        Log.i(TAG, "采集参数: fps=$fpsRangeDesc 防抖=$stabilizationDesc")
+        Log.i(TAG, "采集参数: fps=$fpsRangeDesc 防抖=$stabilizationDesc 预览=$previewDesc")
     }
 
     fun close() {
+        closed = true
+        PreviewRegistry.removeListener(this)
         handler.post {
             try { session?.close() } catch (_: Throwable) {}
             session = null

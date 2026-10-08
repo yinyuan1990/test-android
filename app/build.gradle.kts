@@ -35,5 +35,8 @@ android {
 dependencies {
     implementation(libs.androidx.core.ktx)
     implementation(libs.srtdroid.core)
+    // OTG 外接 USB 摄像头：AUSBC 3.5.3（ernestp 维护分支），libuvc 须显式声明（libausbc 的 POM 把它标成 runtime）
+    implementation("com.github.ernestp.AndroidUSBCamera:libausbc:3.5.3")
+    implementation("com.github.ernestp.AndroidUSBCamera:libuvc:3.5.3")
     testImplementation(libs.junit)
 }
